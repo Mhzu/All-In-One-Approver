@@ -40,7 +40,7 @@ function saveData() {
 
 loadData();
 
-// ========== HTTP ==========
+// ========== HTTP ENDPOINTS ==========
 
 app.get('/check', (req, res) => {
     const user = (req.query.user || '').toLowerCase();
@@ -61,7 +61,7 @@ app.post('/request', async (req, res) => {
     if (blacklist.has(lower)) return res.json({ ok: true, auto: 'blacklisted' });
     if (whitelist.has(lower)) return res.json({ ok: true, auto: 'whitelisted' });
 
-    // Send as DM to the owner (easy to dismiss)
+    // Send as DM to the owner
     try {
         const owner = await client.users.fetch(process.env.OWNER_ID);
         if (!owner) return res.status(500).json({ error: 'owner not found' });
@@ -92,9 +92,10 @@ app.post('/request', async (req, res) => {
     }
 });
 
-// ========== BUTTONS ==========
+// ========== BUTTONS + SLASH COMMANDS ==========
 
 client.on('interactionCreate', async (interaction) => {
+    // Buttons
     if (interaction.isButton()) {
         if (interaction.user.id !== process.env.OWNER_ID) {
             return interaction.reply({ content: 'Only the owner can use these buttons.', ephemeral: true });
@@ -142,6 +143,7 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
+    // Slash commands
     if (!interaction.isChatInputCommand()) return;
     if (interaction.user.id !== process.env.OWNER_ID) {
         return interaction.reply({ content: 'Only the owner can use these commands.', ephemeral: true });
@@ -154,6 +156,7 @@ client.on('interactionCreate', async (interaction) => {
     if (cmd === 'whitelist') {
         whitelist.add(lower);
         blacklist.delete(lower);
+        tempApproved.add(lower);
         saveData();
         await interaction.reply(`✅ **${userOption}** has been **whitelisted**.`);
     } else if (cmd === 'blacklist') {
@@ -164,8 +167,9 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply(`🚫 **${userOption}** has been **blacklisted**.`);
     } else if (cmd === 'unwhitelist') {
         whitelist.delete(lower);
+        tempApproved.delete(lower); // clears temp access too
         saveData();
-        await interaction.reply(`Removed **${userOption}** from the whitelist.`);
+        await interaction.reply(`Removed **${userOption}** from the whitelist. They will need permission again.`);
     } else if (cmd === 'unblacklist') {
         blacklist.delete(lower);
         saveData();
@@ -173,18 +177,35 @@ client.on('interactionCreate', async (interaction) => {
     } else if (cmd === 'list') {
         const w = [...whitelist].join(', ') || '(empty)';
         const b = [...blacklist].join(', ') || '(empty)';
-        await interaction.reply({ content: `**Whitelist:**\n${w}\n\n**Blacklist:**\n${b}`, ephemeral: true });
+        await interaction.reply({
+            content: `**Whitelist:**\n${w}\n\n**Blacklist:**\n${b}`,
+            ephemeral: true
+        });
     }
 });
 
-// ========== SLASH COMMANDS ==========
+// ========== REGISTER SLASH COMMANDS ==========
 
 const commands = [
-    new SlashCommandBuilder().setName('whitelist').setDescription('Permanently allow a user').addStringOption(o => o.setName('username').setDescription('Roblox username').setRequired(true)),
-    new SlashCommandBuilder().setName('blacklist').setDescription('Permanently deny a user').addStringOption(o => o.setName('username').setDescription('Roblox username').setRequired(true)),
-    new SlashCommandBuilder().setName('unwhitelist').setDescription('Remove from whitelist').addStringOption(o => o.setName('username').setDescription('Roblox username').setRequired(true)),
-    new SlashCommandBuilder().setName('unblacklist').setDescription('Remove from blacklist').addStringOption(o => o.setName('username').setDescription('Roblox username').setRequired(true)),
-    new SlashCommandBuilder().setName('list').setDescription('Show whitelist and blacklist')
+    new SlashCommandBuilder()
+        .setName('whitelist')
+        .setDescription('Permanently allow a user to open the hub')
+        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('blacklist')
+        .setDescription('Permanently deny a user from opening the hub')
+        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('unwhitelist')
+        .setDescription('Remove a user from the whitelist')
+        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('unblacklist')
+        .setDescription('Remove a user from the blacklist')
+        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('list')
+        .setDescription('Show current whitelist and blacklist')
 ].map(c => c.toJSON());
 
 client.once('ready', async () => {
