@@ -4,22 +4,20 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages] });
 const app = express();
 app.use(express.json());
 
-// Persistent storage file
 const DATA_FILE = path.join(__dirname, 'data.json');
 
 let whitelist = new Set();
 let blacklist = new Set();
-let tempApproved = new Set(); // one-time accepts from buttons
+let tempApproved = new Set();
 
 function loadData() {
     try {
         if (fs.existsSync(DATA_FILE)) {
-            const raw = fs.readFileSync(DATA_FILE, 'utf8');
-            const data = JSON.parse(raw);
+            const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
             whitelist = new Set((data.whitelist || []).map(u => u.toLowerCase()));
             blacklist = new Set((data.blacklist || []).map(u => u.toLowerCase()));
             console.log(`Loaded ${whitelist.size} whitelist, ${blacklist.size} blacklist`);
@@ -42,21 +40,15 @@ function saveData() {
 
 loadData();
 
-// ========== HTTP ENDPOINTS ==========
+// ========== HTTP ==========
 
 app.get('/check', (req, res) => {
     const user = (req.query.user || '').toLowerCase();
     if (!user) return res.json({ approved: false });
 
-    if (blacklist.has(user)) {
-        return res.json({ approved: false, status: 'blacklisted' });
-    }
-    if (whitelist.has(user)) {
-        return res.json({ approved: true, status: 'whitelisted' });
-    }
-    if (tempApproved.has(user)) {
-        return res.json({ approved: true, status: 'temp' });
-    }
+    if (blacklist.has(user)) return res.json({ approved: false, status: 'blacklisted' });
+    if (whitelist.has(user)) return res.json({ approved: true, status: 'whitelisted' });
+    if (tempApproved.has(user)) return res.json({ approved: true, status: 'temp' });
     return res.json({ approved: false, status: 'pending' });
 });
 
@@ -66,40 +58,41 @@ app.post('/request', async (req, res) => {
 
     const lower = username.toLowerCase();
 
-    // Auto-handle if already in lists
-    if (blacklist.has(lower)) {
-        return res.json({ ok: true, auto: 'blacklisted' });
+    if (blacklist.has(lower)) return res.json({ ok: true, auto: 'blacklisted' });
+    if (whitelist.has(lower)) return res.json({ ok: true, auto: 'whitelisted' });
+
+    // Send as DM to the owner (easy to dismiss)
+    try {
+        const owner = await client.users.fetch(process.env.OWNER_ID);
+        if (!owner) return res.status(500).json({ error: 'owner not found' });
+
+        const embed = new EmbedBuilder()
+            .setTitle('Hub Access Request')
+            .setDescription(`**${displayName || username}** (\`${username}\`) wants to open the hub.`)
+            .addFields(
+                { name: 'Place', value: String(place || 'unknown'), inline: true },
+                { name: 'User', value: username, inline: true },
+                { name: 'Server', value: jobId ? `\`${jobId}\`` : 'n/a', inline: false }
+            )
+            .setColor(0xFF3333)
+            .setTimestamp();
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`accept_${username}`).setLabel('Accept').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`deny_${username}`).setLabel('Deny').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(`whitelist_${username}`).setLabel('Whitelist').setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`blacklist_${username}`).setLabel('Blacklist').setStyle(ButtonStyle.Secondary)
+        );
+
+        await owner.send({ embeds: [embed], components: [row] });
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('Failed to DM owner:', e.message);
+        res.status(500).json({ error: 'failed to DM owner – open DMs from server members' });
     }
-    if (whitelist.has(lower)) {
-        return res.json({ ok: true, auto: 'whitelisted' });
-    }
-
-    const channel = await client.channels.fetch(process.env.APPROVAL_CHANNEL_ID).catch(() => null);
-    if (!channel) return res.status(500).json({ error: 'channel not found' });
-
-    const embed = new EmbedBuilder()
-        .setTitle('Hub Access Request')
-        .setDescription(`**${displayName || username}** (\`${username}\`) wants to open the hub.`)
-        .addFields(
-            { name: 'Place', value: String(place || 'unknown'), inline: true },
-            { name: 'User', value: username, inline: true },
-            { name: 'Server', value: jobId ? `\`${jobId}\`` : 'n/a', inline: false }
-        )
-        .setColor(0xFF3333)
-        .setTimestamp();
-
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`accept_${username}`).setLabel('Accept').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`deny_${username}`).setLabel('Deny').setStyle(ButtonStyle.Danger),
-        new ButtonBuilder().setCustomId(`whitelist_${username}`).setLabel('Whitelist').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`blacklist_${username}`).setLabel('Blacklist').setStyle(ButtonStyle.Secondary)
-    );
-
-    await channel.send({ embeds: [embed], components: [row] });
-    res.json({ ok: true });
 });
 
-// ========== BUTTON HANDLER ==========
+// ========== BUTTONS ==========
 
 client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton()) {
@@ -115,14 +108,14 @@ client.on('interactionCreate', async (interaction) => {
             tempApproved.add(lower);
             await interaction.update({
                 content: `✅ **Accepted** (one-time) \`${username}\``,
-                embeds: interaction.message.embeds,
+                embeds: [],
                 components: []
             });
         } else if (action === 'deny') {
             tempApproved.delete(lower);
             await interaction.update({
                 content: `❌ **Denied** \`${username}\``,
-                embeds: interaction.message.embeds,
+                embeds: [],
                 components: []
             });
         } else if (action === 'whitelist') {
@@ -132,7 +125,7 @@ client.on('interactionCreate', async (interaction) => {
             saveData();
             await interaction.update({
                 content: `✅ **Whitelisted** \`${username}\` (permanent)`,
-                embeds: interaction.message.embeds,
+                embeds: [],
                 components: []
             });
         } else if (action === 'blacklist') {
@@ -142,14 +135,13 @@ client.on('interactionCreate', async (interaction) => {
             saveData();
             await interaction.update({
                 content: `🚫 **Blacklisted** \`${username}\` (permanent)`,
-                embeds: interaction.message.embeds,
+                embeds: [],
                 components: []
             });
         }
         return;
     }
 
-    // ========== SLASH COMMANDS ==========
     if (!interaction.isChatInputCommand()) return;
     if (interaction.user.id !== process.env.OWNER_ID) {
         return interaction.reply({ content: 'Only the owner can use these commands.', ephemeral: true });
@@ -163,63 +155,41 @@ client.on('interactionCreate', async (interaction) => {
         whitelist.add(lower);
         blacklist.delete(lower);
         saveData();
-        await interaction.reply(`✅ **${userOption}** has been **whitelisted**. They can open the hub anytime.`);
-    }
-    else if (cmd === 'blacklist') {
+        await interaction.reply(`✅ **${userOption}** has been **whitelisted**.`);
+    } else if (cmd === 'blacklist') {
         blacklist.add(lower);
         whitelist.delete(lower);
         tempApproved.delete(lower);
         saveData();
-        await interaction.reply(`🚫 **${userOption}** has been **blacklisted**. They will always be denied.`);
-    }
-    else if (cmd === 'unwhitelist') {
+        await interaction.reply(`🚫 **${userOption}** has been **blacklisted**.`);
+    } else if (cmd === 'unwhitelist') {
         whitelist.delete(lower);
         saveData();
         await interaction.reply(`Removed **${userOption}** from the whitelist.`);
-    }
-    else if (cmd === 'unblacklist') {
+    } else if (cmd === 'unblacklist') {
         blacklist.delete(lower);
         saveData();
         await interaction.reply(`Removed **${userOption}** from the blacklist.`);
-    }
-    else if (cmd === 'list') {
+    } else if (cmd === 'list') {
         const w = [...whitelist].join(', ') || '(empty)';
         const b = [...blacklist].join(', ') || '(empty)';
-        await interaction.reply({
-            content: `**Whitelist:**\n${w}\n\n**Blacklist:**\n${b}`,
-            ephemeral: true
-        });
+        await interaction.reply({ content: `**Whitelist:**\n${w}\n\n**Blacklist:**\n${b}`, ephemeral: true });
     }
 });
 
-// ========== REGISTER SLASH COMMANDS ==========
+// ========== SLASH COMMANDS ==========
 
 const commands = [
-    new SlashCommandBuilder()
-        .setName('whitelist')
-        .setDescription('Permanently allow a user to open the hub')
-        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
-    new SlashCommandBuilder()
-        .setName('blacklist')
-        .setDescription('Permanently deny a user from opening the hub')
-        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
-    new SlashCommandBuilder()
-        .setName('unwhitelist')
-        .setDescription('Remove a user from the whitelist')
-        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
-    new SlashCommandBuilder()
-        .setName('unblacklist')
-        .setDescription('Remove a user from the blacklist')
-        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
-    new SlashCommandBuilder()
-        .setName('list')
-        .setDescription('Show current whitelist and blacklist')
+    new SlashCommandBuilder().setName('whitelist').setDescription('Permanently allow a user').addStringOption(o => o.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder().setName('blacklist').setDescription('Permanently deny a user').addStringOption(o => o.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder().setName('unwhitelist').setDescription('Remove from whitelist').addStringOption(o => o.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder().setName('unblacklist').setDescription('Remove from blacklist').addStringOption(o => o.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder().setName('list').setDescription('Show whitelist and blacklist')
 ].map(c => c.toJSON());
 
 client.once('ready', async () => {
     console.log(`Bot ready as ${client.user.tag}`);
 
-    // Register slash commands
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
         await rest.put(
