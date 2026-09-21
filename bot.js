@@ -1,21 +1,78 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes, SlashCommandBuilder } = require('discord.js');
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const app = express();
 app.use(express.json());
 
-const approved = new Set();
+// Persistent storage file
+const DATA_FILE = path.join(__dirname, 'data.json');
+
+let whitelist = new Set();
+let blacklist = new Set();
+let tempApproved = new Set(); // one-time accepts from buttons
+
+function loadData() {
+    try {
+        if (fs.existsSync(DATA_FILE)) {
+            const raw = fs.readFileSync(DATA_FILE, 'utf8');
+            const data = JSON.parse(raw);
+            whitelist = new Set((data.whitelist || []).map(u => u.toLowerCase()));
+            blacklist = new Set((data.blacklist || []).map(u => u.toLowerCase()));
+            console.log(`Loaded ${whitelist.size} whitelist, ${blacklist.size} blacklist`);
+        }
+    } catch (e) {
+        console.log('No existing data file, starting fresh');
+    }
+}
+
+function saveData() {
+    try {
+        fs.writeFileSync(DATA_FILE, JSON.stringify({
+            whitelist: [...whitelist],
+            blacklist: [...blacklist]
+        }, null, 2));
+    } catch (e) {
+        console.error('Failed to save data:', e.message);
+    }
+}
+
+loadData();
+
+// ========== HTTP ENDPOINTS ==========
 
 app.get('/check', (req, res) => {
     const user = (req.query.user || '').toLowerCase();
-    res.json({ approved: approved.has(user) });
+    if (!user) return res.json({ approved: false });
+
+    if (blacklist.has(user)) {
+        return res.json({ approved: false, status: 'blacklisted' });
+    }
+    if (whitelist.has(user)) {
+        return res.json({ approved: true, status: 'whitelisted' });
+    }
+    if (tempApproved.has(user)) {
+        return res.json({ approved: true, status: 'temp' });
+    }
+    return res.json({ approved: false, status: 'pending' });
 });
 
 app.post('/request', async (req, res) => {
     const { username, displayName, place, jobId } = req.body;
     if (!username) return res.status(400).json({ error: 'missing username' });
+
+    const lower = username.toLowerCase();
+
+    // Auto-handle if already in lists
+    if (blacklist.has(lower)) {
+        return res.json({ ok: true, auto: 'blacklisted' });
+    }
+    if (whitelist.has(lower)) {
+        return res.json({ ok: true, auto: 'whitelisted' });
+    }
 
     const channel = await client.channels.fetch(process.env.APPROVAL_CHANNEL_ID).catch(() => null);
     if (!channel) return res.status(500).json({ error: 'channel not found' });
@@ -33,41 +90,147 @@ app.post('/request', async (req, res) => {
 
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`accept_${username}`).setLabel('Accept').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`deny_${username}`).setLabel('Deny').setStyle(ButtonStyle.Danger)
+        new ButtonBuilder().setCustomId(`deny_${username}`).setLabel('Deny').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`whitelist_${username}`).setLabel('Whitelist').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`blacklist_${username}`).setLabel('Blacklist').setStyle(ButtonStyle.Secondary)
     );
 
     await channel.send({ embeds: [embed], components: [row] });
     res.json({ ok: true });
 });
 
+// ========== BUTTON HANDLER ==========
+
 client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isButton()) return;
-    if (interaction.user.id !== process.env.OWNER_ID) {
-        return interaction.reply({ content: 'Only the owner can accept/deny.', ephemeral: true });
+    if (interaction.isButton()) {
+        if (interaction.user.id !== process.env.OWNER_ID) {
+            return interaction.reply({ content: 'Only the owner can use these buttons.', ephemeral: true });
+        }
+
+        const [action, ...rest] = interaction.customId.split('_');
+        const username = rest.join('_');
+        const lower = username.toLowerCase();
+
+        if (action === 'accept') {
+            tempApproved.add(lower);
+            await interaction.update({
+                content: `✅ **Accepted** (one-time) \`${username}\``,
+                embeds: interaction.message.embeds,
+                components: []
+            });
+        } else if (action === 'deny') {
+            tempApproved.delete(lower);
+            await interaction.update({
+                content: `❌ **Denied** \`${username}\``,
+                embeds: interaction.message.embeds,
+                components: []
+            });
+        } else if (action === 'whitelist') {
+            whitelist.add(lower);
+            blacklist.delete(lower);
+            tempApproved.add(lower);
+            saveData();
+            await interaction.update({
+                content: `✅ **Whitelisted** \`${username}\` (permanent)`,
+                embeds: interaction.message.embeds,
+                components: []
+            });
+        } else if (action === 'blacklist') {
+            blacklist.add(lower);
+            whitelist.delete(lower);
+            tempApproved.delete(lower);
+            saveData();
+            await interaction.update({
+                content: `🚫 **Blacklisted** \`${username}\` (permanent)`,
+                embeds: interaction.message.embeds,
+                components: []
+            });
+        }
+        return;
     }
 
-    const [action, username] = interaction.customId.split('_');
-    const lower = username.toLowerCase();
+    // ========== SLASH COMMANDS ==========
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.user.id !== process.env.OWNER_ID) {
+        return interaction.reply({ content: 'Only the owner can use these commands.', ephemeral: true });
+    }
 
-    if (action === 'accept') {
-        approved.add(lower);
-        await interaction.update({
-            content: `✅ **Accepted** \`${username}\``,
-            embeds: interaction.message.embeds,
-            components: []
-        });
-    } else if (action === 'deny') {
-        approved.delete(lower);
-        await interaction.update({
-            content: `❌ **Denied** \`${username}\``,
-            embeds: interaction.message.embeds,
-            components: []
+    const cmd = interaction.commandName;
+    const userOption = interaction.options.getString('username');
+    const lower = userOption ? userOption.toLowerCase() : null;
+
+    if (cmd === 'whitelist') {
+        whitelist.add(lower);
+        blacklist.delete(lower);
+        saveData();
+        await interaction.reply(`✅ **${userOption}** has been **whitelisted**. They can open the hub anytime.`);
+    }
+    else if (cmd === 'blacklist') {
+        blacklist.add(lower);
+        whitelist.delete(lower);
+        tempApproved.delete(lower);
+        saveData();
+        await interaction.reply(`🚫 **${userOption}** has been **blacklisted**. They will always be denied.`);
+    }
+    else if (cmd === 'unwhitelist') {
+        whitelist.delete(lower);
+        saveData();
+        await interaction.reply(`Removed **${userOption}** from the whitelist.`);
+    }
+    else if (cmd === 'unblacklist') {
+        blacklist.delete(lower);
+        saveData();
+        await interaction.reply(`Removed **${userOption}** from the blacklist.`);
+    }
+    else if (cmd === 'list') {
+        const w = [...whitelist].join(', ') || '(empty)';
+        const b = [...blacklist].join(', ') || '(empty)';
+        await interaction.reply({
+            content: `**Whitelist:**\n${w}\n\n**Blacklist:**\n${b}`,
+            ephemeral: true
         });
     }
 });
 
-client.once('ready', () => {
+// ========== REGISTER SLASH COMMANDS ==========
+
+const commands = [
+    new SlashCommandBuilder()
+        .setName('whitelist')
+        .setDescription('Permanently allow a user to open the hub')
+        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('blacklist')
+        .setDescription('Permanently deny a user from opening the hub')
+        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('unwhitelist')
+        .setDescription('Remove a user from the whitelist')
+        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('unblacklist')
+        .setDescription('Remove a user from the blacklist')
+        .addStringOption(opt => opt.setName('username').setDescription('Roblox username').setRequired(true)),
+    new SlashCommandBuilder()
+        .setName('list')
+        .setDescription('Show current whitelist and blacklist')
+].map(c => c.toJSON());
+
+client.once('ready', async () => {
     console.log(`Bot ready as ${client.user.tag}`);
+
+    // Register slash commands
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    try {
+        await rest.put(
+            Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
+            { body: commands }
+        );
+        console.log('Slash commands registered');
+    } catch (e) {
+        console.error('Failed to register commands:', e);
+    }
+
     const port = process.env.PORT || 3000;
     app.listen(port, () => console.log(`HTTP server listening on port ${port}`));
 });
