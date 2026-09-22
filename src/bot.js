@@ -229,9 +229,6 @@ app.get("/check", async (req, res) => {
       return res.status(400).json({ approved: false });
     }
 
-    // Record this Roblox account and, if it is brand new, send it to the log channel.
-    await logNewHubUser(userId, username);
-
     const permanent = await getPermanentStatus(userId);
 
     if (permanent === "blacklisted") {
@@ -270,6 +267,10 @@ app.post("/request", async (req, res) => {
         error: "missing username, userId, or sessionId"
       });
     }
+
+    // Record every Roblox account the first time it requests hub access.
+    // This is intentionally done in /request because /check does not receive a username.
+    await logNewHubUser(userId, username);
 
     const permanent = await getPermanentStatus(userId);
 
