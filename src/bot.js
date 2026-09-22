@@ -25,6 +25,12 @@ const pool = new Pool({
 
 async function initDb() {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS hub_users (
+      user_id TEXT PRIMARY KEY,
+      username TEXT,
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS permanent_whitelist (
       user_id TEXT PRIMARY KEY,
       username TEXT,
@@ -45,6 +51,43 @@ async function initDb() {
       decided_at TIMESTAMPTZ
     );
   `);
+}
+
+async function logNewHubUser(userId, username) {
+  const id = String(userId);
+  const name = String(username || "unknown");
+
+  const result = await pool.query(
+    `INSERT INTO hub_users (user_id, username)
+     VALUES ($1, $2)
+     ON CONFLICT (user_id) DO NOTHING`,
+    [id, name]
+  );
+
+  // Only send to the log channel the first time this Roblox UserId is seen.
+  if (result.rowCount === 0) return false;
+
+  const channelId = String(process.env.ROBLOX_LOG_CHANNEL_ID || "").trim();
+  if (!channelId) {
+    console.warn("ROBLOX_LOG_CHANNEL_ID is not set; new-user logging is disabled.");
+    return true;
+  }
+
+  const channel = await client.channels.fetch(channelId).catch((err) => {
+    console.error("Could not fetch ROBLOX_LOG_CHANNEL_ID:", err?.message || err);
+    return null;
+  });
+
+  if (!channel || !channel.isTextBased()) {
+    console.error("ROBLOX_LOG_CHANNEL_ID is not a text-based Discord channel.");
+    return true;
+  }
+
+  await channel.send(`Roblox Username: **${name}**\nUser ID: \`${id}\``).catch((err) => {
+    console.error("Could not send new-user log:", err?.message || err);
+  });
+
+  return true;
 }
 
 async function getPermanentStatus(userId) {
@@ -185,6 +228,9 @@ app.get("/check", async (req, res) => {
     if (!userId || !sessionId) {
       return res.status(400).json({ approved: false });
     }
+
+    // Record this Roblox account and, if it is brand new, send it to the log channel.
+    await logNewHubUser(userId, username);
 
     const permanent = await getPermanentStatus(userId);
 
