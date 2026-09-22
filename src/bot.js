@@ -275,6 +275,11 @@ app.post("/request", async (req, res) => {
       new ButtonBuilder()
         .setCustomId(`blacklist:${userId}:${sessionId}:${username}`)
         .setLabel("Blacklist")
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`copyid:${userId}`)
+        .setLabel("Copy User ID")
+        .setEmoji("📋")
         .setStyle(ButtonStyle.Secondary)
     );
 
@@ -305,6 +310,22 @@ app.post("/request", async (req, res) => {
 });
 
 client.on("interactionCreate", async (interaction) => {
+  if (interaction.isButton() && interaction.customId.startsWith("copyid:")) {
+    if (interaction.user.id !== process.env.OWNER_ID) {
+      return interaction.reply({ content: "Only the owner can use this button.", ephemeral: true });
+    }
+
+    const userId = interaction.customId.slice("copyid:".length);
+    if (!/^\d+$/.test(userId)) {
+      return interaction.reply({ content: "❌ Invalid Roblox UserId.", ephemeral: true });
+    }
+
+    return interaction.reply({
+      content: `📋 **Roblox UserId**\n\`\`\`text\n${userId}\n\`\`\`\nUse Discord's copy button on the code block to copy it.`,
+      ephemeral: true
+    });
+  }
+
   if (interaction.isChatInputCommand()) {
     if (interaction.user.id !== process.env.OWNER_ID) {
       return interaction.reply({ content: "Only the owner can use these commands.", ephemeral: true });
@@ -318,7 +339,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
 
       if (command === "whitelist") {
-        if (!/^\\d+$/.test(userId || "")) {
+        if (!/^\d+$/.test(userId || "")) {
           return interaction.editReply("❌ Invalid Roblox UserId. Use the numeric UserId.");
         }
         await addWhitelist(userId, username);
@@ -326,7 +347,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (command === "blacklist") {
-        if (!/^\\d+$/.test(userId || "")) {
+        if (!/^\d+$/.test(userId || "")) {
           return interaction.editReply("❌ Invalid Roblox UserId. Use the numeric UserId.");
         }
         await addBlacklist(userId, username);
@@ -334,7 +355,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (command === "unwhitelist") {
-        if (!/^\\d+$/.test(userId || "")) {
+        if (!/^\d+$/.test(userId || "")) {
           return interaction.editReply("❌ Invalid Roblox UserId. Use the numeric UserId.");
         }
         const removed = await removeWhitelist(userId);
@@ -344,7 +365,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (command === "unblacklist") {
-        if (!/^\\d+$/.test(userId || "")) {
+        if (!/^\d+$/.test(userId || "")) {
           return interaction.editReply("❌ Invalid Roblox UserId. Use the numeric UserId.");
         }
         const removed = await removeBlacklist(userId);
@@ -356,7 +377,7 @@ client.on("interactionCreate", async (interaction) => {
       if (command === "list") {
         const { whitelist, blacklist } = await getLists();
         const format = (rows) => rows.length
-          ? rows.map(r => `\`${r.user_id}\` — ${r.username || "unknown"}`).join("\\n")
+          ? rows.map(r => `\`${r.user_id}\` — ${r.username || "unknown"}`).join("\n")
           : "None";
         const embed = new EmbedBuilder()
           .setTitle("Current Access Lists")
