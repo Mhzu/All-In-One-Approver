@@ -3,12 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "main": "src/bot.js",
-  "scripts": {
-    "start": "node src/bot.js"
-  },
-  "engines": {
-    "node": ">=20 <26"
-  },
+  "scripts": { "start": "node src/bot.js" },
+  "engines": { "node": ">=20 <26" },
   "dependencies": {
     "discord.js": "^14.24.2",
     "dotenv": "^17.2.2",
