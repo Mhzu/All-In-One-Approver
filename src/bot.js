@@ -28,8 +28,11 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS hub_users (
       user_id TEXT PRIMARY KEY,
       username TEXT,
-      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      logged_at TIMESTAMPTZ
     );
+
+    ALTER TABLE hub_users ADD COLUMN IF NOT EXISTS logged_at TIMESTAMPTZ;
 
     CREATE TABLE IF NOT EXISTS permanent_whitelist (
       user_id TEXT PRIMARY KEY,
@@ -54,23 +57,20 @@ async function initDb() {
 }
 
 async function logNewHubUser(userId, username) {
-  const id = String(userId);
-  const name = String(username || "unknown");
+  const id = String(userId).trim();
+  const name = String(username || "unknown").trim();
 
-  const result = await pool.query(
-    `INSERT INTO hub_users (user_id, username)
-     VALUES ($1, $2)
-     ON CONFLICT (user_id) DO NOTHING`,
-    [id, name]
+  // If this user was already successfully logged, do nothing.
+  const existing = await pool.query(
+    "SELECT logged_at FROM hub_users WHERE user_id = $1 LIMIT 1",
+    [id]
   );
-
-  // Only send to the log channel the first time this Roblox UserId is seen.
-  if (result.rowCount === 0) return false;
+  if (existing.rowCount && existing.rows[0].logged_at) return false;
 
   const channelId = String(process.env.ROBLOX_LOG_CHANNEL_ID || "").trim();
   if (!channelId) {
-    console.warn("ROBLOX_LOG_CHANNEL_ID is not set; new-user logging is disabled.");
-    return true;
+    console.error("ROBLOX_LOG_CHANNEL_ID is not set; cannot log new Roblox users.");
+    return false;
   }
 
   const channel = await client.channels.fetch(channelId).catch((err) => {
@@ -80,7 +80,7 @@ async function logNewHubUser(userId, username) {
 
   if (!channel || !channel.isTextBased()) {
     console.error("ROBLOX_LOG_CHANNEL_ID is not a text-based Discord channel.");
-    return true;
+    return false;
   }
 
   const logRow = new ActionRowBuilder().addComponents(
@@ -91,13 +91,26 @@ async function logNewHubUser(userId, username) {
       .setStyle(ButtonStyle.Secondary)
   );
 
-  await channel.send({
-    content: `Roblox Username: **${name}**\nUser ID: \`${id}\``,
-    components: [logRow]
-  }).catch((err) => {
+  try {
+    await channel.send({
+      content: `Roblox Username: **${name}**\nUser ID: \`${id}\``,
+      components: [logRow]
+    });
+  } catch (err) {
     console.error("Could not send new-user log:", err?.message || err);
-  });
+    return false;
+  }
 
+  // Only mark the user as logged AFTER Discord accepted the message.
+  await pool.query(
+    `INSERT INTO hub_users (user_id, username, logged_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (user_id)
+     DO UPDATE SET username = EXCLUDED.username, logged_at = NOW()`,
+    [id, name]
+  );
+
+  console.log(`Logged new Roblox user ${name} (${id}) to channel ${channelId}`);
   return true;
 }
 
@@ -546,4 +559,3 @@ start().catch((err) => {
   console.error("Fatal startup error:", err);
   process.exit(1);
 });
-
