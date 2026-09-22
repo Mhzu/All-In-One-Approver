@@ -84,12 +84,6 @@ app.post("/request", async (req, res) => {
       return res.json({ ok: true, approved: true });
     }
 
-    const channel = await client.channels
-      .fetch(process.env.APPROVAL_CHANNEL_ID)
-      .catch(() => null);
-
-    if (!channel) return res.status(500).json({ error: "channel not found" });
-
     const embed = new EmbedBuilder()
       .setTitle("Hub Access Request")
       .setDescription(`**${displayName || username}** (\`${username}\`) wants to open the hub.`)
@@ -114,7 +108,26 @@ app.post("/request", async (req, res) => {
         .setStyle(ButtonStyle.Danger)
     );
 
-    await channel.send({ embeds: [embed], components: [row] });
+    // DM the owner only. Do not fall back to the approval channel.
+    const owner = await client.users.fetch(String(process.env.OWNER_ID)).catch((err) => {
+      console.error("Could not fetch OWNER_ID:", err?.message || err);
+      return null;
+    });
+
+    if (!owner) {
+      return res.status(500).json({ error: "could not find OWNER_ID on Discord" });
+    }
+
+    try {
+      const dm = await owner.createDM();
+      await dm.send({ embeds: [embed], components: [row] });
+    } catch (dmErr) {
+      console.error("Owner DM failed:", dmErr?.message || dmErr);
+      return res.status(500).json({
+        error: "could not DM owner; check OWNER_ID and Discord DM privacy settings"
+      });
+    }
+
     res.json({ ok: true, approved: false });
   } catch (err) {
     console.error("request error:", err);
