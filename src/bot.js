@@ -83,7 +83,18 @@ async function logNewHubUser(userId, username) {
     return true;
   }
 
-  await channel.send(`Roblox Username: **${name}**\nUser ID: \`${id}\``).catch((err) => {
+  const logRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`copyid:${id}`)
+      .setLabel("Copy User ID")
+      .setEmoji("📋")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  await channel.send({
+    content: `Roblox Username: **${name}**\nUser ID: \`${id}\``,
+    components: [logRow]
+  }).catch((err) => {
     console.error("Could not send new-user log:", err?.message || err);
   });
 
@@ -322,11 +333,6 @@ app.post("/request", async (req, res) => {
       new ButtonBuilder()
         .setCustomId(`blacklist:${userId}:${sessionId}:${username}`)
         .setLabel("Blacklist")
-        .setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder()
-        .setCustomId(`copyid:${userId}`)
-        .setLabel("Copy User ID")
-        .setEmoji("📋")
         .setStyle(ButtonStyle.Secondary)
     );
 
@@ -540,3 +546,4 @@ start().catch((err) => {
   console.error("Fatal startup error:", err);
   process.exit(1);
 });
+
