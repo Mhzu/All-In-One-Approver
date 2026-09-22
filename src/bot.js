@@ -25,36 +25,91 @@ const pool = new Pool({
 
 async function initDb() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS approved_users (
+    CREATE TABLE IF NOT EXISTS permanent_whitelist (
       user_id TEXT PRIMARY KEY,
       username TEXT,
       approved_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
+    );
+
+    CREATE TABLE IF NOT EXISTS permanent_blacklist (
+      user_id TEXT PRIMARY KEY,
+      username TEXT,
+      blocked_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS access_sessions (
+      session_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      username TEXT,
+      decision TEXT NOT NULL DEFAULT 'pending',
+      decided_at TIMESTAMPTZ
+    );
   `);
 }
 
-async function isApproved(userId) {
-  const r = await pool.query(
-    "SELECT 1 FROM approved_users WHERE user_id = $1 LIMIT 1",
-    [String(userId)]
+async function getPermanentStatus(userId) {
+  const id = String(userId);
+
+  const black = await pool.query(
+    "SELECT 1 FROM permanent_blacklist WHERE user_id = $1 LIMIT 1", [id]
   );
-  return r.rowCount > 0;
+  if (black.rowCount) return "blacklisted";
+
+  const white = await pool.query(
+    "SELECT 1 FROM permanent_whitelist WHERE user_id = $1 LIMIT 1", [id]
+  );
+  if (white.rowCount) return "whitelisted";
+
+  return "none";
 }
 
-async function approveUser(userId, username) {
+async function getSessionDecision(userId, sessionId) {
+  const r = await pool.query(
+    "SELECT decision FROM access_sessions WHERE session_id = $1 AND user_id = $2 LIMIT 1",
+    [String(sessionId), String(userId)]
+  );
+  return r.rowCount ? r.rows[0].decision : "none";
+}
+
+async function setSessionDecision(userId, username, sessionId, decision) {
   await pool.query(
-    `INSERT INTO approved_users (user_id, username)
+    `INSERT INTO access_sessions (session_id, user_id, username, decision, decided_at)
+     VALUES ($1, $2, $3, $4, NOW())
+     ON CONFLICT (session_id)
+     DO UPDATE SET user_id = EXCLUDED.user_id,
+                   username = EXCLUDED.username,
+                   decision = EXCLUDED.decision,
+                   decided_at = NOW()`,
+    [String(sessionId), String(userId), String(username || "unknown"), decision]
+  );
+}
+
+async function addWhitelist(userId, username) {
+  await pool.query(
+    `INSERT INTO permanent_whitelist (user_id, username)
      VALUES ($1, $2)
      ON CONFLICT (user_id)
-     DO UPDATE SET username = EXCLUDED.username`,
+     DO UPDATE SET username = EXCLUDED.username, approved_at = NOW()`,
     [String(userId), String(username || "unknown")]
+  );
+  await pool.query(
+    "DELETE FROM permanent_blacklist WHERE user_id = $1", [String(userId)]
   );
 }
 
-async function denyUser(userId) {
+async function addBlacklist(userId, username) {
   await pool.query(
-    "DELETE FROM approved_users WHERE user_id = $1",
-    [String(userId)]
+    `INSERT INTO permanent_blacklist (user_id, username)
+     VALUES ($1, $2)
+     ON CONFLICT (user_id)
+     DO UPDATE SET username = EXCLUDED.username, blocked_at = NOW()`,
+    [String(userId), String(username || "unknown")]
+  );
+  await pool.query(
+    "DELETE FROM permanent_whitelist WHERE user_id = $1", [String(userId)]
+  );
+  await pool.query(
+    "DELETE FROM access_sessions WHERE user_id = $1", [String(userId)]
   );
 }
 
@@ -63,8 +118,33 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 app.get("/check", async (req, res) => {
   try {
     const userId = String(req.query.userId || "").trim();
-    if (!userId) return res.status(400).json({ approved: false });
-    res.json({ approved: await isApproved(userId) });
+    const sessionId = String(req.query.sessionId || "").trim();
+
+    if (!userId || !sessionId) {
+      return res.status(400).json({ approved: false });
+    }
+
+    const permanent = await getPermanentStatus(userId);
+
+    if (permanent === "blacklisted") {
+      return res.json({ approved: false, denied: true, blacklisted: true });
+    }
+
+    if (permanent === "whitelisted") {
+      return res.json({ approved: true, whitelisted: true });
+    }
+
+    const decision = await getSessionDecision(userId, sessionId);
+
+    if (decision === "accepted") {
+      return res.json({ approved: true });
+    }
+
+    if (decision === "denied") {
+      return res.json({ approved: false, denied: true });
+    }
+
+    res.json({ approved: false });
   } catch (err) {
     console.error("check error:", err);
     res.status(500).json({ approved: false });
@@ -73,15 +153,34 @@ app.get("/check", async (req, res) => {
 
 app.post("/request", async (req, res) => {
   try {
-    const { username, userId, displayName, place, jobId, placeId } = req.body;
+    const {
+      username, userId, displayName, place, jobId, placeId, sessionId
+    } = req.body;
 
-    if (!username || !userId) {
-      return res.status(400).json({ error: "missing username or userId" });
+    if (!username || !userId || !sessionId) {
+      return res.status(400).json({
+        error: "missing username, userId, or sessionId"
+      });
     }
 
-    // Already-approved users skip the Discord approval step.
-    if (await isApproved(userId)) {
+    const permanent = await getPermanentStatus(userId);
+
+    if (permanent === "blacklisted") {
+      return res.json({ ok: true, approved: false, blacklisted: true });
+    }
+
+    if (permanent === "whitelisted") {
+      return res.json({ ok: true, approved: true, whitelisted: true });
+    }
+
+    const decision = await getSessionDecision(userId, sessionId);
+
+    if (decision === "accepted") {
       return res.json({ ok: true, approved: true });
+    }
+
+    if (decision === "denied") {
+      return res.json({ ok: true, approved: false, denied: true });
     }
 
     const embed = new EmbedBuilder()
@@ -92,6 +191,7 @@ app.post("/request", async (req, res) => {
         { name: "UserId", value: String(userId), inline: true },
         { name: "Place", value: String(place || "unknown"), inline: true },
         { name: "Place ID", value: String(placeId || "unknown"), inline: true },
+        { name: "Session", value: `\`${String(sessionId).slice(0, 24)}\``, inline: false },
         { name: "Server", value: jobId ? `\`${jobId}\`` : "n/a", inline: false }
       )
       .setColor(0xff3333)
@@ -99,16 +199,23 @@ app.post("/request", async (req, res) => {
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
-        .setCustomId(`accept:${userId}:${username}`)
+        .setCustomId(`accept:${userId}:${sessionId}:${username}`)
         .setLabel("Accept")
         .setStyle(ButtonStyle.Success),
       new ButtonBuilder()
-        .setCustomId(`deny:${userId}:${username}`)
+        .setCustomId(`deny:${userId}:${sessionId}:${username}`)
         .setLabel("Deny")
-        .setStyle(ButtonStyle.Danger)
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId(`whitelist:${userId}:${sessionId}:${username}`)
+        .setLabel("Whitelist")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`blacklist:${userId}:${sessionId}:${username}`)
+        .setLabel("Blacklist")
+        .setStyle(ButtonStyle.Secondary)
     );
 
-    // DM the owner only. Do not fall back to the approval channel.
     const owner = await client.users.fetch(String(process.env.OWNER_ID)).catch((err) => {
       console.error("Could not fetch OWNER_ID:", err?.message || err);
       return null;
@@ -140,35 +247,63 @@ client.on("interactionCreate", async (interaction) => {
 
   if (interaction.user.id !== process.env.OWNER_ID) {
     return interaction.reply({
-      content: "Only the owner can accept/deny.",
+      content: "Only the owner can use these buttons.",
       ephemeral: true
     });
   }
 
-  const [action, userId, ...nameParts] = interaction.customId.split(":");
-  const username = nameParts.join(":") || "unknown";
+  const parts = interaction.customId.split(":");
+  const action = parts[0];
+  const userId = parts[1];
+  const sessionId = parts[2];
+  const username = parts.slice(3).join(":") || "unknown";
 
   try {
     if (action === "accept") {
-      await approveUser(userId, username);
+      await setSessionDecision(userId, username, sessionId, "accepted");
       await interaction.update({
-        content: `✅ **Accepted permanently** \`${username}\` (UserId: ${userId})`,
+        content: `✅ **Accepted for this session only** — \`${username}\`\nThis does NOT whitelist them.`,
         embeds: interaction.message.embeds,
         components: []
       });
-    } else if (action === "deny") {
-      await denyUser(userId);
+      return;
+    }
+
+    if (action === "deny") {
+      await setSessionDecision(userId, username, sessionId, "denied");
       await interaction.update({
-        content: `❌ **Denied** \`${username}\` (UserId: ${userId})`,
+        content: `❌ **Denied** — \`${username}\`\nThis does NOT blacklist them.`,
         embeds: interaction.message.embeds,
         components: []
       });
+      return;
+    }
+
+    if (action === "whitelist") {
+      await addWhitelist(userId, username);
+      await setSessionDecision(userId, username, sessionId, "accepted");
+      await interaction.update({
+        content: `✅ **Whitelisted permanently** — \`${username}\``,
+        embeds: interaction.message.embeds,
+        components: []
+      });
+      return;
+    }
+
+    if (action === "blacklist") {
+      await addBlacklist(userId, username);
+      await interaction.update({
+        content: `⛔ **Blacklisted permanently** — \`${username}\``,
+        embeds: interaction.message.embeds,
+        components: []
+      });
+      return;
     }
   } catch (err) {
     console.error("interaction error:", err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({
-        content: "Database error while updating the whitelist.",
+        content: "Database error while updating this request.",
         ephemeral: true
       }).catch(() => {});
     }
