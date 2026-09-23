@@ -242,6 +242,8 @@ const slashCommands = [
   }
 ];
 
+app.get("/wake", (_req, res) => res.status(200).send("Bot is awake. You can return to Discord and use your commands."));
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/check", async (req, res) => {
