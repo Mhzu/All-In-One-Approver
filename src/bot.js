@@ -623,20 +623,55 @@ client.on("interactionCreate", async (interaction) => {
 let retryTimer = null;
 let retryAttempt = 0;
 
+async function checkDiscordGateway() {
+  try {
+    const started = Date.now();
+    const response = await fetch("https://discord.com/api/v10/gateway", {
+      headers: { "User-Agent": "All-In-One-Approver/1.0" },
+      signal: AbortSignal.timeout(10000)
+    });
+    const body = await response.text();
+    console.log(`Discord REST gateway check: HTTP ${response.status} (${Date.now() - started}ms)`);
+    if (response.ok) {
+      try {
+        const data = JSON.parse(body);
+        console.log(`Discord gateway endpoint reachable: ${data.url || "yes"}`);
+      } catch {
+        console.log("Discord gateway endpoint returned a non-JSON success response.");
+      }
+    } else {
+      console.error(`Discord gateway response body: ${body.slice(0, 500)}`);
+    }
+    return response.ok;
+  } catch (err) {
+    console.error(`Discord gateway check failed: ${err?.name || "Error"}: ${err?.message || err}`);
+    return false;
+  }
+}
+
 async function loginDiscord(reason = "startup") {
   if (client.isReady() || loginInProgress) return;
 
   loginInProgress = true;
   console.log(`Attempting Discord login (${reason})...`);
 
+  // Discord.js can leave login() pending when the Gateway/WebSocket cannot be
+  // reached. Force a bounded attempt so Render does not sit silently forever.
   try {
-    // Intentionally no short timeout here. A Gateway connection can take longer
-    // than 20 seconds, and a timeout only hides the real Discord/network error.
-    await client.login(process.env.DISCORD_TOKEN);
+    await checkDiscordGateway();
+
+    const loginPromise = client.login(process.env.DISCORD_TOKEN);
+    await Promise.race([
+      loginPromise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Discord login attempt exceeded 30 seconds; Gateway connection may be blocked or unreachable from this host.")), 30000)
+      )
+    ]);
+
     retryAttempt = 0;
     console.log("Discord login call completed; waiting for READY event...");
   } catch (err) {
-    console.error("Discord login failed:");
+    console.error("Discord login failed or timed out:");
     console.error(err?.stack || err);
 
     const status = err?.status ?? err?.statusCode ?? err?.response?.status;
@@ -644,6 +679,8 @@ async function loginDiscord(reason = "startup") {
     if (status) console.error(`Discord/HTTP status: ${status}`);
     if (code) console.error(`Error code: ${code}`);
 
+    // Reset the client so the next attempt starts a fresh Gateway connection.
+    try { client.destroy(); } catch {}
     scheduleDiscordRetry();
   } finally {
     loginInProgress = false;
