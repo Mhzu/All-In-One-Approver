@@ -294,33 +294,7 @@ app.get("/", (_req, res) => {
     : "All-In-One Approver web service is online, but the Discord bot is not connected.");
 });
 
-app.get("/discord-test", async (_req, res) => {
-  const started = Date.now();
-  try {
-    const gateway = await fetch("https://discord.com/api/v10/gateway");
-    const body = await gateway.text();
-    console.log(`Discord HTTPS test: ${gateway.status} (${Date.now() - started}ms)`);
-    res.status(200).json({
-      ok: gateway.ok,
-      discordStatus: gateway.status,
-      responseTimeMs: Date.now() - started,
-      botConnected: client.isReady(),
-      message: gateway.ok
-        ? "Render can reach Discord over HTTPS."
-        : "Render reached Discord, but Discord returned a non-2xx response.",
-      discordResponse: body.slice(0, 500)
-    });
-  } catch (err) {
-    console.error("Discord HTTPS test failed:", err?.stack || err);
-    res.status(502).json({
-      ok: false,
-      botConnected: client.isReady(),
-      error: err?.message || String(err)
-    });
-  }
-});
-
-app.get("/wake", async (_req, res) => {
+app.get("/wake", (_req, res) => {
   if (client.isReady()) {
     return res.status(200).json({
       ok: true,
@@ -337,35 +311,15 @@ app.get("/wake", async (_req, res) => {
     });
   }
 
-  loginInProgress = true;
+  // Do not wait for Discord here. Render needs the HTTP request to finish quickly,
+  // while the Gateway connection continues in the background.
+  loginDiscord("/wake");
 
-  try {
-    console.log("Wake endpoint called: attempting Discord login...");
-    const loginPromise = client.login(process.env.DISCORD_TOKEN);
-    await Promise.race([
-      loginPromise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Discord login timed out after 20 seconds.")), 20000)
-      )
-    ]);
-
-    return res.status(200).json({
-      ok: true,
-      connected: client.isReady(),
-      message: client.isReady()
-        ? "Discord bot connected successfully."
-        : "Discord login was accepted; waiting for READY event."
-    });
-  } catch (err) {
-    console.error("Wake/login failed:", err?.stack || err);
-    return res.status(500).json({
-      ok: false,
-      connected: false,
-      error: err?.message || String(err)
-    });
-  } finally {
-    loginInProgress = false;
-  }
+  return res.status(202).json({
+    ok: true,
+    connected: false,
+    message: "Discord login started in the background. Check /health or Render logs."
+  });
 });
 
 app.get("/health", (_req, res) => res.json({
@@ -666,6 +620,50 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+let retryTimer = null;
+let retryAttempt = 0;
+
+async function loginDiscord(reason = "startup") {
+  if (client.isReady() || loginInProgress) return;
+
+  loginInProgress = true;
+  console.log(`Attempting Discord login (${reason})...`);
+
+  try {
+    // Intentionally no short timeout here. A Gateway connection can take longer
+    // than 20 seconds, and a timeout only hides the real Discord/network error.
+    await client.login(process.env.DISCORD_TOKEN);
+    retryAttempt = 0;
+    console.log("Discord login call completed; waiting for READY event...");
+  } catch (err) {
+    console.error("Discord login failed:");
+    console.error(err?.stack || err);
+
+    const status = err?.status ?? err?.statusCode ?? err?.response?.status;
+    const code = err?.code ?? err?.cause?.code;
+    if (status) console.error(`Discord/HTTP status: ${status}`);
+    if (code) console.error(`Error code: ${code}`);
+
+    scheduleDiscordRetry();
+  } finally {
+    loginInProgress = false;
+  }
+}
+
+function scheduleDiscordRetry() {
+  if (client.isReady() || retryTimer) return;
+
+  retryAttempt += 1;
+  const delay = Math.min(300000, 15000 * Math.pow(2, Math.min(retryAttempt - 1, 4)));
+
+  console.log(`Discord reconnect attempt #${retryAttempt} scheduled in ${Math.round(delay / 1000)} seconds.`);
+
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    loginDiscord(`automatic retry #${retryAttempt}`);
+  }, delay);
+}
+
 async function start() {
   await initDb();
 
@@ -674,24 +672,12 @@ async function start() {
     console.log(`HTTP server listening on ${port}`);
   });
 
-  console.log("Attempting Discord login...");
-  loginInProgress = true;
-
-  try {
-    const loginPromise = client.login(process.env.DISCORD_TOKEN);
-    await Promise.race([
-      loginPromise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Discord login timed out after 20 seconds.")), 20000)
-      )
-    ]);
-    console.log("Discord login call completed; waiting for READY event...");
-  } finally {
-    loginInProgress = false;
-  }
+  // Keep Render's web process alive even if Discord temporarily rejects the
+  // connection. The bot will keep retrying instead of crashing the service.
+  loginDiscord("startup");
 }
 
 start().catch((err) => {
-  console.error("Fatal startup error:", err);
+  console.error("Fatal startup error:", err?.stack || err);
   process.exit(1);
 });
