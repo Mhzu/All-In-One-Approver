@@ -294,6 +294,32 @@ app.get("/", (_req, res) => {
     : "All-In-One Approver web service is online, but the Discord bot is not connected.");
 });
 
+app.get("/discord-test", async (_req, res) => {
+  const started = Date.now();
+  try {
+    const gateway = await fetch("https://discord.com/api/v10/gateway");
+    const body = await gateway.text();
+    console.log(`Discord HTTPS test: ${gateway.status} (${Date.now() - started}ms)`);
+    res.status(200).json({
+      ok: gateway.ok,
+      discordStatus: gateway.status,
+      responseTimeMs: Date.now() - started,
+      botConnected: client.isReady(),
+      message: gateway.ok
+        ? "Render can reach Discord over HTTPS."
+        : "Render reached Discord, but Discord returned a non-2xx response.",
+      discordResponse: body.slice(0, 500)
+    });
+  } catch (err) {
+    console.error("Discord HTTPS test failed:", err?.stack || err);
+    res.status(502).json({
+      ok: false,
+      botConnected: client.isReady(),
+      error: err?.message || String(err)
+    });
+  }
+});
+
 app.get("/wake", async (_req, res) => {
   if (client.isReady()) {
     return res.status(200).json({
