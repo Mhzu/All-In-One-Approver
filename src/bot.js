@@ -18,6 +18,27 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const app = express();
 app.use(express.json());
 
+let discordLoginInProgress = false;
+let discordLastError = null;
+
+client.once("ready", (readyClient) => {
+  console.log(`Discord bot is READY as ${readyClient.user.tag} (${readyClient.user.id})`);
+});
+
+client.on("error", (err) => {
+  discordLastError = err?.message || String(err);
+  console.error("Discord client error:", discordLastError);
+});
+
+client.on("shardError", (err) => {
+  discordLastError = err?.message || String(err);
+  console.error("Discord gateway/shard error:", discordLastError);
+});
+
+client.on("warn", (msg) => {
+  console.warn("Discord warning:", msg);
+});
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -242,9 +263,40 @@ const slashCommands = [
   }
 ];
 
-app.get("/wake", (_req, res) => res.status(200).send("Bot is awake. You can return to Discord and use your commands."));
+app.get("/", (_req, res) => res.status(200).send("All-In-One Approver is running."));
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/wake", async (_req, res) => {
+  if (client.isReady()) {
+    return res.status(200).send("Bot is already online and ready.");
+  }
+
+  if (discordLoginInProgress) {
+    return res.status(202).send("Bot connection is already being attempted. Check Render logs in a few seconds.");
+  }
+
+  discordLoginInProgress = true;
+  discordLastError = null;
+
+  try {
+    // Clean up any stale gateway state before retrying.
+    client.destroy();
+    await client.login(process.env.DISCORD_TOKEN);
+    return res.status(200).send("Bot login was started successfully. Check Discord/Render logs for the READY message.");
+  } catch (err) {
+    discordLastError = err?.message || String(err);
+    console.error("Wake/login failed:", discordLastError);
+    return res.status(500).send(`Bot login failed: ${discordLastError}`);
+  } finally {
+    discordLoginInProgress = false;
+  }
+});
+
+app.get("/health", (_req, res) => res.json({
+  ok: true,
+  discordReady: client.isReady(),
+  discordUser: client.user?.tag || null,
+  discordLastError
+}));
 
 app.get("/check", async (req, res) => {
   try {
@@ -537,17 +589,12 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-async function start() {
-  await initDb();
-
-  const port = Number(process.env.PORT || 10000);
-  app.listen(port, "0.0.0.0", () => {
-    console.log(`HTTP server listening on ${port}`);
+async function registerSlashCommands() {
+  const approvalChannel = await client.channels.fetch(String(process.env.APPROVAL_CHANNEL_ID)).catch((err) => {
+    console.error("Could not fetch APPROVAL_CHANNEL_ID:", err?.message || err);
+    return null;
   });
 
-  await client.login(process.env.DISCORD_TOKEN);
-
-  const approvalChannel = await client.channels.fetch(String(process.env.APPROVAL_CHANNEL_ID)).catch(() => null);
   const guild = approvalChannel?.guild;
   if (guild) {
     await guild.commands.set(slashCommands);
@@ -557,7 +604,67 @@ async function start() {
   }
 }
 
+async function connectDiscord() {
+  if (client.isReady()) {
+    console.log(`Discord bot is already ready as ${client.user.tag}`);
+    return true;
+  }
+
+  if (discordLoginInProgress) {
+    console.log("Discord login is already in progress.");
+    return false;
+  }
+
+  discordLoginInProgress = true;
+  discordLastError = null;
+
+  try {
+    await client.login(process.env.DISCORD_TOKEN);
+    console.log("Discord login call completed; waiting for READY event...");
+    return true;
+  } catch (err) {
+    discordLastError = err?.message || String(err);
+    console.error("Discord login failed:", discordLastError);
+    return false;
+  } finally {
+    discordLoginInProgress = false;
+  }
+}
+
+async function start() {
+  const port = Number(process.env.PORT || 10000);
+
+  app.listen(port, "0.0.0.0", () => {
+    console.log(`HTTP server listening on ${port}`);
+  });
+
+  try {
+    await initDb();
+    console.log("PostgreSQL database initialized.");
+  } catch (err) {
+    console.error("Database initialization failed:", err?.message || err);
+  }
+
+  const connected = await connectDiscord();
+
+  if (connected) {
+    // Wait for the READY event before registering commands.
+    if (client.isReady()) {
+      await registerSlashCommands();
+    } else {
+      client.once("ready", async () => {
+        try {
+          await registerSlashCommands();
+        } catch (err) {
+          console.error("Slash command registration failed:", err?.message || err);
+        }
+      });
+    }
+  } else {
+    console.error("Discord bot is NOT connected. The Render web service will stay online so /wake can retry the connection.");
+  }
+}
+
 start().catch((err) => {
-  console.error("Fatal startup error:", err);
-  process.exit(1);
+  console.error("Unexpected startup error:", err);
 });
